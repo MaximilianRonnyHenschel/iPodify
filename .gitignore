@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# Test and local artifacts
+.pytest_cache/
+*.log
+.tmp/
+tmp_ipod/
+downloads/
+sample.mp4
+
+# OS files
+.DS_Store
+Thumbs.db
