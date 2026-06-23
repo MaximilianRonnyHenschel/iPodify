@@ -1,0 +1,11 @@
+1
+00:00:01,000 --> 00:00:04,233
+Hello! Welcome to our video on company policy.
+
+2
+00:00:04,233 --> 00:00:13,151
+We are glad you are here today.
+
+3
+00:00:13,151 --> 00:26:44,243
+We will review the policies and procedures that inform our day to day work life.
