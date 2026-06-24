@@ -192,7 +192,7 @@ def test_safe_search_results_returns_empty_list_on_exception(monkeypatch):
 
 
 def test_perform_pipeline_action_download_uses_ytdlp(monkeypatch, tmp_path):
-    target = tmp_path / "download.mp4"
+    target = tmp_path / "download.mp3"
     calls = {}
 
     def fake_download(url, output, *, dry_run=False):
@@ -208,10 +208,10 @@ def test_perform_pipeline_action_download_uses_ytdlp(monkeypatch, tmp_path):
 
 
 def test_perform_pipeline_action_sync_returns_target(monkeypatch, tmp_path):
-    source = tmp_path / "source.mp4"
+    source = tmp_path / "source.mp3"
     source.write_bytes(b"demo")
     ipod_root = tmp_path / "ipod"
-    expected = ipod_root / "Movies" / "demo.mp4"
+    expected = ipod_root / "Music" / "demo.mp3"
 
     def fake_sync(source_path, ipod_path, *, title="video"):
         return expected

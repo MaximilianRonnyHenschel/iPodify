@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -26,7 +27,7 @@ def _resolve_ytdlp_runner() -> list[str]:
     if local_main is not None:
         return [sys.executable, str(local_main)]
 
-    return ["yt-dlp"]
+    return [sys.executable, "-m", "yt_dlp"]
 
 
 def _looks_like_playlist_url(url: str) -> bool:
@@ -43,8 +44,27 @@ def _looks_like_playlist_url(url: str) -> bool:
 
 
 def ensure_ffmpeg_available() -> None:
-    if shutil.which("ffmpeg") is None:
+    if _resolve_ffmpeg_binary() is None:
         raise RuntimeError("ffmpeg was not found on PATH. Install FFmpeg first.")
+
+
+def _resolve_ffmpeg_binary() -> str | None:
+    configured = os.environ.get("NANOSYNC_FFMPEG", "").strip()
+    if configured:
+        configured_path = Path(configured)
+        if configured_path.exists():
+            return str(configured_path)
+        return configured
+
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+
+    bundled_name = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
+    bundled = workspace_root / "bin" / bundled_name
+    if bundled.exists():
+        return str(bundled)
+
+    return None
 
 
 def ensure_ytdlp_available() -> None:
@@ -60,8 +80,15 @@ def build_ffmpeg_command(source: Path | str, target: Path | str) -> list[str]:
         "-y",
         "-i",
         str(source),
-        "-vf",
-        "scale=320:240",
+        "-vn",
+        "-ac",
+        "2",
+        "-ar",
+        "44100",
+        "-b:a",
+        "192k",
+        "-codec:a",
+        "libmp3lame",
         str(target),
     ]
 
@@ -73,10 +100,18 @@ def _playlist_output_template(output: Path | str) -> str:
 
 
 def build_ytdlp_command(url: str, output: Path | str, *, playlist: bool = False) -> list[str]:
+    audio_args = [
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "0",
+    ]
     if playlist:
         return [
             "yt-dlp",
             "--yes-playlist",
+            *audio_args,
             "-o",
             _playlist_output_template(output),
             url,
@@ -84,6 +119,8 @@ def build_ytdlp_command(url: str, output: Path | str, *, playlist: bool = False)
 
     return [
         "yt-dlp",
+        "--no-playlist",
+        *audio_args,
         "-o",
         str(output),
         url,
@@ -105,11 +142,12 @@ def convert_video(source: Path | str, target: Path | str, *, dry_run: bool = Fal
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="dry-run", stderr="")
 
     ensure_ffmpeg_available()
-    return subprocess.run(cmd, check=False, capture_output=True, text=True)
+    resolved = [_resolve_ffmpeg_binary() or cmd[0], *cmd[1:]]
+    return subprocess.run(resolved, check=False, capture_output=True, text=True)
 
 
 def download_youtube(url: str, output: Path | str, *, dry_run: bool = False) -> subprocess.CompletedProcess[str]:
-    """Download a YouTube video or playlist."""
+    """Download YouTube audio as MP3."""
 
     playlist = _looks_like_playlist_url(url)
     cmd = build_ytdlp_command(url, output, playlist=playlist)
@@ -126,21 +164,22 @@ def download_youtube(url: str, output: Path | str, *, dry_run: bool = False) -> 
 def sync_to_ipod(source: Path | str, ipod_root: Path | str, *, title: str = "video") -> Path:
     source = Path(source)
     ipod_root = Path(ipod_root)
-    movies_dir = ipod_root / "Movies"
-    movies_dir.mkdir(parents=True, exist_ok=True)
+    music_dir = ipod_root / "Music"
+    music_dir.mkdir(parents=True, exist_ok=True)
 
-    target = movies_dir / f"{title}.mp4"
+    safe_title = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in title).strip("_") or "track"
+    target = music_dir / f"{safe_title}.mp3"
     target.write_bytes(source.read_bytes())
 
     db_path = ipod_root / "nanosync.db"
     connection = sqlite3.connect(db_path)
     try:
         connection.execute(
-            "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, source_path TEXT NOT NULL, target_path TEXT NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, source_path TEXT NOT NULL, target_path TEXT NOT NULL, format TEXT NOT NULL DEFAULT 'mp3')"
         )
         connection.execute(
-            "INSERT INTO items (title, source_path, target_path) VALUES (?, ?, ?)",
-            (title, str(source), str(target)),
+            "INSERT INTO items (title, source_path, target_path, format) VALUES (?, ?, ?, ?)",
+            (title, str(source), str(target), "mp3"),
         )
         connection.commit()
     finally:

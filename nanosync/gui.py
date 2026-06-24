@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
 import threading
 from pathlib import Path
-from types import SimpleNamespace
-from urllib.parse import parse_qs, urlparse
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import flet as ft
 
@@ -30,7 +32,6 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for missing local che
 
 from nanosync.pipeline import convert_video, download_youtube, sync_to_ipod
 
-# --- Data Handling & Business Logic ---
 
 SAMPLE_ITEMS = [
     {"title": "Bohemian Rhapsody", "artist": "Queen", "source": "youtube", "url": "https://youtube.com/watch?v=example1"},
@@ -39,7 +40,7 @@ SAMPLE_ITEMS = [
 ]
 SEARCH_CACHE: dict[str, list[dict[str, str]]] = {}
 MAX_CACHE_SIZE = 48
-DOWNLOAD_QUEUE = []
+DOWNLOAD_QUEUE: list[dict[str, str]] = []
 
 LANGUAGE_CHOICES = [
     ("de", "Deutsch"),
@@ -59,19 +60,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ready": "Bereit",
         "search_hint": "Bibliothek durchsuchen",
         "playlist_hint": "YouTube-Playlist-URL",
-        "menu_title": "Suche & Import",
-        "menu_help": "Das Menü blendet sich ein, damit die Listenfläche frei bleibt.",
+        "ipod_root_hint": "iPod- oder USB-Root",
+        "menu_title": "Suche, Download & Sync",
+        "menu_help": "Finde Musik, lade sie als MP3 und schiebe sie per Kabel auf den iPod.",
         "import_button": "Playlist importieren",
         "queue_button": "Einreihen",
-        "download_button": "Herunterladen",
+        "download_button": "MP3 herunterladen",
+        "sync_button": "Auf den iPod kopieren",
         "language_label": "Sprache",
-        "screen_subtitle": "Listenansicht · Playlists · Oldschool",
+        "screen_subtitle": "MP3 · iPod Nano · Android",
         "no_results": "Keine Treffer",
         "no_results_hint": "Suche in der Bibliothek oder füge eine Playlist-URL ein.",
         "results_found": "{count} Treffer gefunden.",
         "selected_prefix": "Ausgewählt: {title}",
         "no_item_queue": "Nichts zum Einreihen.",
         "no_item_download": "Nichts zum Herunterladen.",
+        "no_item_sync": "Nichts zum Synchronisieren.",
         "invalid_url": "Ungültige URL für {title}",
         "queued_added": "Zur Warteschlange hinzugefügt: {title}",
         "playlist_url_prompt": "Bitte eine YouTube-Playlist-URL einfügen.",
@@ -79,6 +83,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "playlist_imported": "Playlist importiert: {name}",
         "start_download": "Herunterladen: {title}...",
         "download_complete": "Heruntergeladen: {name}",
+        "start_sync": "Synchronisiere: {title}...",
+        "sync_complete": "Auf den iPod kopiert: {name}",
+        "sync_playlist_complete": "{count} Titel auf den iPod kopiert.",
+        "ipod_root_prompt": "Bitte den iPod- oder USB-Root auswählen.",
+        "choose_folder": "Ordner wählen",
+        "download_and_sync": "MP3 + Sync",
+        "folder_selected": "Ordner gewählt: {name}",
         "clipboard_empty": "Zwischenablage ist leer.",
         "clipboard_pasted": "Zwischenablage eingefügt.",
         "error": "Fehler: {message}",
@@ -87,24 +98,28 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "previous_tooltip": "Vorheriges",
         "next_tooltip": "Nächstes",
         "download_selected_tooltip": "Auswahl herunterladen",
+        "sync_selected_tooltip": "Auswahl auf den iPod kopieren",
     },
     "en": {
         "ready": "Ready",
         "search_hint": "Search the library",
         "playlist_hint": "YouTube playlist URL",
-        "menu_title": "Search & Import",
-        "menu_help": "The menu hides so the list area stays clear.",
+        "ipod_root_hint": "iPod or USB root",
+        "menu_title": "Search, download & sync",
+        "menu_help": "Find music, download it as MP3, and send it to your iPod over cable.",
         "import_button": "Import playlist",
         "queue_button": "Queue",
-        "download_button": "Download",
+        "download_button": "Download MP3",
+        "sync_button": "Copy to iPod",
         "language_label": "Language",
-        "screen_subtitle": "List view · Playlists · Old school",
+        "screen_subtitle": "MP3 · iPod Nano · Android",
         "no_results": "No results",
         "no_results_hint": "Search the library or paste a playlist URL.",
         "results_found": "{count} results found.",
         "selected_prefix": "Selected: {title}",
         "no_item_queue": "Nothing to add to the list.",
         "no_item_download": "Nothing to download.",
+        "no_item_sync": "Nothing to sync.",
         "invalid_url": "Invalid URL for {title}",
         "queued_added": "Added to queue: {title}",
         "playlist_url_prompt": "Please paste a YouTube playlist URL.",
@@ -112,6 +127,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "playlist_imported": "Playlist imported: {name}",
         "start_download": "Downloading: {title}...",
         "download_complete": "Downloaded: {name}",
+        "start_sync": "Syncing: {title}...",
+        "sync_complete": "Copied to iPod: {name}",
+        "sync_playlist_complete": "{count} tracks copied to the iPod.",
+        "ipod_root_prompt": "Please choose the iPod or USB root first.",
+        "choose_folder": "Choose folder",
+        "download_and_sync": "MP3 + Sync",
+        "folder_selected": "Folder selected: {name}",
         "clipboard_empty": "Clipboard is empty.",
         "clipboard_pasted": "Pasted from clipboard.",
         "error": "Error: {message}",
@@ -120,214 +142,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "previous_tooltip": "Previous",
         "next_tooltip": "Next",
         "download_selected_tooltip": "Download selected",
-    },
-    "fr": {
-        "ready": "Prêt",
-        "search_hint": "Rechercher la bibliothèque",
-        "playlist_hint": "URL de playlist YouTube",
-        "menu_title": "Recherche et import",
-        "menu_help": "Le menu se masque pour libérer la zone de liste.",
-        "import_button": "Importer la playlist",
-        "queue_button": "Ajouter à la liste",
-        "download_button": "Télécharger",
-        "language_label": "Langue",
-        "screen_subtitle": "Vue liste · Playlists · Old school",
-        "no_results": "Aucun résultat",
-        "no_results_hint": "Recherchez dans la bibliothèque ou collez une URL de playlist.",
-        "results_found": "{count} résultats trouvés.",
-        "selected_prefix": "Sélectionné : {title}",
-        "no_item_queue": "Rien à ajouter à la liste.",
-        "no_item_download": "Rien à télécharger.",
-        "invalid_url": "URL invalide pour {title}",
-        "queued_added": "Ajouté à la file : {title}",
-        "playlist_url_prompt": "Collez une URL de playlist YouTube.",
-        "start_playlist_import": "Import de la playlist : {name}...",
-        "playlist_imported": "Playlist importée : {name}",
-        "start_download": "Téléchargement : {title}...",
-        "download_complete": "Téléchargé : {name}",
-        "clipboard_empty": "Le presse-papiers est vide.",
-        "clipboard_pasted": "Collé depuis le presse-papiers.",
-        "error": "Erreur : {message}",
-        "paste_tooltip": "Coller depuis le presse-papiers",
-        "menu_tooltip": "Menu",
-        "previous_tooltip": "Précédent",
-        "next_tooltip": "Suivant",
-        "download_selected_tooltip": "Télécharger la sélection",
-    },
-    "es": {
-        "ready": "Listo",
-        "search_hint": "Buscar en la biblioteca",
-        "playlist_hint": "URL de playlist de YouTube",
-        "menu_title": "Búsqueda e importación",
-        "menu_help": "El menú se oculta para dejar libre la vista de lista.",
-        "import_button": "Importar playlist",
-        "queue_button": "Añadir a la lista",
-        "download_button": "Descargar",
-        "language_label": "Idioma",
-        "screen_subtitle": "Vista de lista · Playlists · Old school",
-        "no_results": "Sin resultados",
-        "no_results_hint": "Busca en la biblioteca o pega una URL de playlist.",
-        "results_found": "{count} resultados encontrados.",
-        "selected_prefix": "Seleccionado: {title}",
-        "no_item_queue": "Nada para añadir a la lista.",
-        "no_item_download": "Nada que descargar.",
-        "invalid_url": "URL no válida para {title}",
-        "queued_added": "Añadido a la cola: {title}",
-        "playlist_url_prompt": "Pega una URL de playlist de YouTube.",
-        "start_playlist_import": "Importando playlist: {name}...",
-        "playlist_imported": "Playlist importada: {name}",
-        "start_download": "Descargando: {title}...",
-        "download_complete": "Descargado: {name}",
-        "clipboard_empty": "El portapapeles está vacío.",
-        "clipboard_pasted": "Pegado desde el portapapeles.",
-        "error": "Error: {message}",
-        "paste_tooltip": "Pegar desde el portapapeles",
-        "menu_tooltip": "Menú",
-        "previous_tooltip": "Anterior",
-        "next_tooltip": "Siguiente",
-        "download_selected_tooltip": "Descargar selección",
-    },
-    "it": {
-        "ready": "Pronto",
-        "search_hint": "Cerca nella libreria",
-        "playlist_hint": "URL playlist YouTube",
-        "menu_title": "Ricerca e importazione",
-        "menu_help": "Il menu si nasconde per lasciare libera la vista elenco.",
-        "import_button": "Importa playlist",
-        "queue_button": "Aggiungi alla lista",
-        "download_button": "Scarica",
-        "language_label": "Lingua",
-        "screen_subtitle": "Vista elenco · Playlist · Old school",
-        "no_results": "Nessun risultato",
-        "no_results_hint": "Cerca nella libreria o incolla un URL di playlist.",
-        "results_found": "{count} risultati trovati.",
-        "selected_prefix": "Selezionato: {title}",
-        "no_item_queue": "Niente da aggiungere alla lista.",
-        "no_item_download": "Niente da scaricare.",
-        "invalid_url": "URL non valida per {title}",
-        "queued_added": "Aggiunto alla coda: {title}",
-        "playlist_url_prompt": "Incolla un URL di playlist YouTube.",
-        "start_playlist_import": "Importazione playlist: {name}...",
-        "playlist_imported": "Playlist importata: {name}",
-        "start_download": "Scaricamento: {title}...",
-        "download_complete": "Scaricato: {name}",
-        "clipboard_empty": "Gli appunti sono vuoti.",
-        "clipboard_pasted": "Incollato dagli appunti.",
-        "error": "Errore: {message}",
-        "paste_tooltip": "Incolla dagli appunti",
-        "menu_tooltip": "Menu",
-        "previous_tooltip": "Precedente",
-        "next_tooltip": "Successivo",
-        "download_selected_tooltip": "Scarica selezione",
-    },
-    "nl": {
-        "ready": "Klaar",
-        "search_hint": "Bibliotheek doorzoeken",
-        "playlist_hint": "YouTube-afspeellijst-URL",
-        "menu_title": "Zoeken en importeren",
-        "menu_help": "Het menu verbergt zich zodat de lijst vrij blijft.",
-        "import_button": "Afspeellijst importeren",
-        "queue_button": "Toevoegen aan lijst",
-        "download_button": "Download",
-        "language_label": "Taal",
-        "screen_subtitle": "Lijstweergave · Afspeellijsten · Oldschool",
-        "no_results": "Geen resultaten",
-        "no_results_hint": "Zoek in de bibliotheek of plak een afspeellijst-URL.",
-        "results_found": "{count} resultaten gevonden.",
-        "selected_prefix": "Geselecteerd: {title}",
-        "no_item_queue": "Niets om aan de lijst toe te voegen.",
-        "no_item_download": "Niets om te downloaden.",
-        "invalid_url": "Ongeldige URL voor {title}",
-        "queued_added": "Toegevoegd aan wachtrij: {title}",
-        "playlist_url_prompt": "Plak een YouTube-afspeellijst-URL.",
-        "start_playlist_import": "Afspeellijst wordt geïmporteerd: {name}...",
-        "playlist_imported": "Afspeellijst geïmporteerd: {name}",
-        "start_download": "Bezig met downloaden: {title}...",
-        "download_complete": "Gedownload: {name}",
-        "clipboard_empty": "Het klembord is leeg.",
-        "clipboard_pasted": "Geplakt vanuit klembord.",
-        "error": "Fout: {message}",
-        "paste_tooltip": "Plakken vanuit klembord",
-        "menu_tooltip": "Menu",
-        "previous_tooltip": "Vorige",
-        "next_tooltip": "Volgende",
-        "download_selected_tooltip": "Geselecteerde downloaden",
-    },
-    "pl": {
-        "ready": "Gotowe",
-        "search_hint": "Przeszukaj bibliotekę",
-        "playlist_hint": "Adres listy odtwarzania YouTube",
-        "menu_title": "Wyszukiwanie i import",
-        "menu_help": "Menu ukrywa się, aby lista pozostała czytelna.",
-        "import_button": "Importuj playlistę",
-        "queue_button": "Dodaj do listy",
-        "download_button": "Pobierz",
-        "language_label": "Język",
-        "screen_subtitle": "Widok listy · Playlisty · Oldschool",
-        "no_results": "Brak wyników",
-        "no_results_hint": "Szukaj w bibliotece lub wklej adres playlisty.",
-        "results_found": "Znaleziono {count} wyników.",
-        "selected_prefix": "Zaznaczono: {title}",
-        "no_item_queue": "Nic do dodania do listy.",
-        "no_item_download": "Nic do pobrania.",
-        "invalid_url": "Nieprawidłowy adres URL dla {title}",
-        "queued_added": "Dodano do kolejki: {title}",
-        "playlist_url_prompt": "Wklej adres playlisty YouTube.",
-        "start_playlist_import": "Import playlisty: {name}...",
-        "playlist_imported": "Playlista zaimportowana: {name}",
-        "start_download": "Pobieranie: {title}...",
-        "download_complete": "Pobrano: {name}",
-        "clipboard_empty": "Schowek jest pusty.",
-        "clipboard_pasted": "Wklejono ze schowka.",
-        "error": "Błąd: {message}",
-        "paste_tooltip": "Wklej ze schowka",
-        "menu_tooltip": "Menu",
-        "previous_tooltip": "Poprzedni",
-        "next_tooltip": "Następny",
-        "download_selected_tooltip": "Pobierz zaznaczone",
-    },
-    "pt": {
-        "ready": "Pronto",
-        "search_hint": "Procurar na biblioteca",
-        "playlist_hint": "URL da playlist do YouTube",
-        "menu_title": "Pesquisa e importação",
-        "menu_help": "O menu oculta-se para deixar a lista livre.",
-        "import_button": "Importar playlist",
-        "queue_button": "Adicionar à lista",
-        "download_button": "Transferir",
-        "language_label": "Idioma",
-        "screen_subtitle": "Vista de lista · Playlists · Old school",
-        "no_results": "Sem resultados",
-        "no_results_hint": "Procura na biblioteca ou cola um URL de playlist.",
-        "results_found": "{count} resultados encontrados.",
-        "selected_prefix": "Selecionado: {title}",
-        "no_item_queue": "Nada para adicionar à lista.",
-        "no_item_download": "Nada para transferir.",
-        "invalid_url": "URL inválido para {title}",
-        "queued_added": "Adicionado à fila: {title}",
-        "playlist_url_prompt": "Cola um URL de playlist do YouTube.",
-        "start_playlist_import": "A importar playlist: {name}...",
-        "playlist_imported": "Playlist importada: {name}",
-        "start_download": "A transferir: {title}...",
-        "download_complete": "Transferido: {name}",
-        "clipboard_empty": "A área de transferência está vazia.",
-        "clipboard_pasted": "Colado da área de transferência.",
-        "error": "Erro: {message}",
-        "paste_tooltip": "Colar da área de transferência",
-        "menu_tooltip": "Menu",
-        "previous_tooltip": "Anterior",
-        "next_tooltip": "Seguinte",
-        "download_selected_tooltip": "Transferir seleção",
+        "sync_selected_tooltip": "Copy selected to iPod",
     },
 }
 
 
 def _set_language(language_code: str) -> None:
     global CURRENT_LANGUAGE
-    if language_code in TRANSLATIONS:
-        CURRENT_LANGUAGE = language_code
-    else:
-        CURRENT_LANGUAGE = "de"
+    CURRENT_LANGUAGE = language_code if language_code in TRANSLATIONS else "de"
 
 
 def _t(key: str, **kwargs: Any) -> str:
@@ -335,9 +157,11 @@ def _t(key: str, **kwargs: Any) -> str:
     value = language.get(key, TRANSLATIONS["de"].get(key, key))
     return value.format(**kwargs)
 
+
 def _safe_filename(name: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name)
     return cleaned.strip("_")[:64] or "track"
+
 
 def _filter_sample_items(normalized: str, *, limit: int = 8) -> list[dict[str, str]]:
     if not normalized:
@@ -348,9 +172,11 @@ def _filter_sample_items(normalized: str, *, limit: int = 8) -> list[dict[str, s
         if normalized in item["title"].lower() or normalized in item["artist"].lower()
     ][:limit]
 
+
 def _fallback_items(normalized: str, *, limit: int = 8) -> list[dict[str, str]]:
     matches = _filter_sample_items(normalized, limit=limit)
     return matches if matches else _filter_sample_items("", limit=limit)
+
 
 def _cache_result(normalized: str, items: list[dict[str, str]]) -> list[dict[str, str]]:
     if normalized and normalized not in SEARCH_CACHE:
@@ -358,6 +184,7 @@ def _cache_result(normalized: str, items: list[dict[str, str]]) -> list[dict[str
             SEARCH_CACHE.pop(next(iter(SEARCH_CACHE)))
         SEARCH_CACHE[normalized] = items[:8]
     return items[:8]
+
 
 def _items_from_payload(payload: Any) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
@@ -441,11 +268,14 @@ def _convert_info_to_items(info: Any, *, url: str | None = None, playlist_mode: 
 
 
 def _ytdlp_command_base(query: str, *, url_mode: bool) -> list[str]:
-    if local_yt_dlp.exists() and (local_yt_dlp / "yt_dlp").exists():
-        main_py = local_yt_dlp / "yt_dlp" / "__main__.py"
-        if main_py.exists():
-            return [sys.executable, str(main_py)]
-    return [sys.executable, "-m", "yt_dlp"] if url_mode else [sys.executable, "-m", "yt_dlp"]
+    if shutil.which("yt-dlp"):
+        return ["yt-dlp"]
+
+    local_main = local_yt_dlp / "yt_dlp" / "__main__.py"
+    if local_main.exists():
+        return [sys.executable, str(local_main)]
+
+    return [sys.executable, "-m", "yt_dlp"]
 
 
 def _run_ytdlp_subprocess(query: str, *, url_mode: bool) -> subprocess.CompletedProcess[str]:
@@ -489,6 +319,7 @@ def _parse_ytdlp_stdout(stdout: str, *, url_mode: bool, url: str | None = None) 
             continue
         items.extend(_items_from_payload(payload))
     return items
+
 
 def search_music_results(query: str) -> list[dict[str, str]]:
     raw_query = (query or "").strip()
@@ -536,11 +367,30 @@ def search_music_results(query: str) -> list[dict[str, str]]:
 
     return _cache_result(cache_key, _fallback_items(normalized))
 
+
 def safe_search_results(query: str) -> list[dict[str, str]]:
     try:
         return search_music_results(query)
     except Exception:
         return []
+
+
+def _resolve_ffmpeg_binary() -> str:
+    configured = os.environ.get("NANOSYNC_FFMPEG", "").strip()
+    if configured:
+        return configured
+
+    binary = shutil.which("ffmpeg")
+    if binary:
+        return binary
+
+    bundled_name = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
+    bundled = workspace_root / "bin" / bundled_name
+    if bundled.exists():
+        return str(bundled)
+
+    raise RuntimeError("ffmpeg was not found on PATH. Install FFmpeg first.")
+
 
 def perform_pipeline_action(command: str, **kwargs: Any) -> str:
     if command == "convert":
@@ -558,7 +408,7 @@ def perform_pipeline_action(command: str, **kwargs: Any) -> str:
     if command == "sync":
         source = Path(kwargs["source"])
         ipod_root = Path(kwargs["ipod_root"])
-        target = sync_to_ipod(source, ipod_root, title=kwargs.get("title", "video"))
+        target = sync_to_ipod(source, ipod_root, title=kwargs.get("title", "track"))
         return f"Sync completed: {target}"
 
     raise ValueError(f"Unsupported command: {command}")
@@ -567,8 +417,11 @@ def perform_pipeline_action(command: str, **kwargs: Any) -> str:
 def _download_target_for_item(item: dict[str, str]) -> Path:
     title = _safe_filename(item["title"])
     if item.get("kind") == "playlist":
-        return workspace_root / "downloads" / title
-    return workspace_root / "downloads" / f"{title}.mp4"
+        playlist_target = _playlist_download_target(item.get("url", ""))
+        if playlist_target is not None:
+            return playlist_target
+        return workspace_root / "downloads" / "playlists" / title
+    return workspace_root / "downloads" / f"{title}.mp3"
 
 
 def _playlist_id_from_url(url: str) -> str | None:
@@ -592,17 +445,14 @@ def _playlist_download_target(url: str) -> Path | None:
 
 
 def _png_to_ico_bytes(png_bytes: bytes) -> bytes:
-    # Windows ICO files can embed a PNG image directly.
     image_offset = 6 + 16
     width = struct.unpack(">I", png_bytes[16:20])[0] if len(png_bytes) >= 20 else 0
     height = struct.unpack(">I", png_bytes[20:24])[0] if len(png_bytes) >= 24 else 0
     width_byte = width if width < 256 else 0
     height_byte = height if height < 256 else 0
-    header = struct.pack(
-        "<HHHBBBBHHII",
-        0,
-        1,
-        1,
+    header = struct.pack("<HHH", 0, 1, 1)
+    entry = struct.pack(
+        "<BBBBHHII",
         width_byte,
         height_byte,
         0,
@@ -612,49 +462,41 @@ def _png_to_ico_bytes(png_bytes: bytes) -> bytes:
         len(png_bytes),
         image_offset,
     )
-    return header + png_bytes
+    return header + entry + png_bytes
 
 
 def _ensure_logo_ico() -> Path | None:
     if not logo_png_path.exists():
         return None
 
-    try:
-        png_mtime = logo_png_path.stat().st_mtime
-        if not logo_ico_path.exists() or logo_ico_path.stat().st_mtime < png_mtime:
-            logo_ico_path.write_bytes(_png_to_ico_bytes(logo_png_path.read_bytes()))
-    except Exception:
-        return None
-
+    png_bytes = logo_png_path.read_bytes()
+    ico_bytes = _png_to_ico_bytes(png_bytes)
+    if logo_ico_path.exists() and logo_ico_path.read_bytes() == ico_bytes:
+        return logo_ico_path
+    logo_ico_path.write_bytes(ico_bytes)
     return logo_ico_path
 
 
 def _apply_window_icon(page: ft.Page) -> None:
-    icon_path = _ensure_logo_ico()
-    window = getattr(page, "window", None)
-    if icon_path is None or window is None:
-        return
+    ico_path = _ensure_logo_ico()
+    if ico_path is not None and hasattr(page.window, "icon"):
+        page.window.icon = str(ico_path)
 
-    try:
-        window.icon = str(icon_path)
-    except Exception:
-        pass
+
+IPOD_BODY_WIDTH = 520
+IPOD_BODY_ASPECT_RATIO = 1.55
+IPOD_BODY_HEIGHT = int(round(IPOD_BODY_WIDTH * IPOD_BODY_ASPECT_RATIO))
+IPOD_STAGE_WIDTH = IPOD_BODY_WIDTH
+IPOD_STAGE_HEIGHT = IPOD_BODY_HEIGHT
+IPOD_SCREEN_WIDTH = 488
+IPOD_SCREEN_HEIGHT = 600
+IPOD_WHEEL_SIZE = 192
 
 
 def _configure_window(page: ft.Page, colors: dict[str, str]) -> None:
     window = getattr(page, "window", None)
     if window is None:
         return
-
-    try:
-        page.padding = 0
-    except Exception:
-        pass
-
-    try:
-        page.spacing = 0
-    except Exception:
-        pass
 
     for attr, value in (
         ("width", IPOD_STAGE_WIDTH),
@@ -663,16 +505,9 @@ def _configure_window(page: ft.Page, colors: dict[str, str]) -> None:
         ("min_height", IPOD_STAGE_HEIGHT),
         ("max_width", IPOD_STAGE_WIDTH),
         ("max_height", IPOD_STAGE_HEIGHT),
+        ("resizable", False),
         ("frameless", True),
         ("title_bar_hidden", True),
-        ("title_bar_buttons_hidden", True),
-        ("resizable", False),
-        ("minimizable", False),
-        ("maximizable", False),
-        ("movable", True),
-        ("full_screen", False),
-        ("bgcolor", colors["background"]),
-        ("shadow", False),
     ):
         try:
             setattr(window, attr, value)
@@ -680,29 +515,7 @@ def _configure_window(page: ft.Page, colors: dict[str, str]) -> None:
             pass
 
     try:
-        center_result = window.center()
-        if inspect.isawaitable(center_result):
-            async def _center_window() -> None:
-                try:
-                    await center_result
-                except Exception:
-                    pass
-
-            runner = getattr(page, "run_task", None)
-            if callable(runner):
-                try:
-                    runner(_center_window)
-                    return
-                except Exception:
-                    pass
-
-            try:
-                asyncio.run(_center_window())
-            except RuntimeError:
-                try:
-                    center_result.close()
-                except Exception:
-                    pass
+        window.center()
     except Exception:
         pass
 
@@ -711,71 +524,56 @@ def _configure_window(page: ft.Page, colors: dict[str, str]) -> None:
     except Exception:
         pass
 
-    for attr, value in (
-        ("window_width", IPOD_STAGE_WIDTH),
-        ("window_height", IPOD_STAGE_HEIGHT),
-        ("window_min_width", IPOD_STAGE_WIDTH),
-        ("window_min_height", IPOD_STAGE_HEIGHT),
-    ):
-        try:
-            setattr(page, attr, value)
-        except Exception:
-            pass
+    page.padding = 0
+    page.spacing = 0
+    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+    page.vertical_alignment = ft.MainAxisAlignment.CENTER
+    page.bgcolor = colors["background"]
 
 
 def _cover_source(item: dict[str, str]) -> str:
-    return item.get("cover") or fallback_cover_src
+    cover = item.get("cover")
+    return cover if isinstance(cover, str) and cover else fallback_cover_src
 
 
 def _source_display_label(source: str) -> str:
     normalized = (source or "").strip().lower()
-    if normalized in {"youtube", "yt"}:
+    if "youtube" in normalized:
         return "YouTube"
-    if normalized == "local":
+    if normalized in {"local", "file"}:
         return "Lokal"
-    return normalized.capitalize() if normalized else "Unbekannt"
+    return normalized.title() if normalized else "Unbekannt"
 
 
 def _border(color: str, width: int = 1) -> ft.Border:
-    side = ft.BorderSide(width=width, color=color)
-    return ft.Border(left=side, top=side, right=side, bottom=side)
+    return ft.border.all(width, color)
 
 
 async def _read_clipboard_text(clipboard: Any) -> str:
-    try:
-        value = await clipboard.get()
-    except Exception:
+    if clipboard is None:
         return ""
-    return str(value or "").strip()
 
+    getter = getattr(clipboard, "get", None)
+    if getter is None:
+        return ""
 
-IPOD_BODY_ASPECT_RATIO = 1.7641489844858633
-IPOD_BODY_WIDTH = 520
-IPOD_BODY_HEIGHT = int(round(IPOD_BODY_WIDTH * IPOD_BODY_ASPECT_RATIO))
-IPOD_STAGE_WIDTH = IPOD_BODY_WIDTH
-IPOD_STAGE_HEIGHT = IPOD_BODY_HEIGHT
-IPOD_SCREEN_WIDTH = 488
-IPOD_SCREEN_HEIGHT = 600
-COVERFLOW_TILT = 0.46
-COVERFLOW_SHIFT = 26
-COVERFLOW_DROP = 9
-COVERFLOW_SCALE = 0.20
-IPOD_WHEEL_SIZE = 192
-COVER_CARD_WIDTH = 252
-COVER_CARD_HEIGHT = 206
+    result = getter()
+    if inspect.isawaitable(result):
+        result = await result
+
+    if result is None:
+        return ""
+    return str(result).strip()
 
 
 def _coverflow_transform(relative_index: int) -> ft.Transform:
     if relative_index == 0:
         return ft.Transform(matrix=ft.Matrix4.identity())
 
-    direction = -1 if relative_index < 0 else 1
-    distance = min(abs(relative_index), 2)
-    depth_multiplier = 1.0 if distance == 1 else 1.55
-    tilt = COVERFLOW_TILT * direction * depth_multiplier
-    shift = COVERFLOW_SHIFT * direction * depth_multiplier
-    drop = COVERFLOW_DROP * depth_multiplier
-    scale = max(0.62, 1.0 - (COVERFLOW_SCALE * depth_multiplier))
+    tilt = -0.25 if relative_index < 0 else 0.25
+    shift = -18 if relative_index < 0 else 18
+    scale = 0.92
+    drop = abs(relative_index) * 4
     matrix = (
         ft.Matrix4.identity()
         .rotate_y(tilt)
@@ -783,6 +581,20 @@ def _coverflow_transform(relative_index: int) -> ft.Transform:
         .scale(scale, scale, scale)
     )
     return ft.Transform(matrix=matrix)
+
+
+def _run_async(page: ft.Page, coro: Any) -> None:
+    runner = getattr(page, "run_task", None)
+    if callable(runner):
+        try:
+            async def _wrapper() -> Any:
+                return await coro
+
+            runner(_wrapper)
+            return
+        except Exception:
+            pass
+    asyncio.run(coro)
 
 
 def _start_download_job(
@@ -797,7 +609,7 @@ def _start_download_job(
     status_bar.value = start_message
     page.update()
 
-    def do_download():
+    def do_download() -> None:
         try:
             message = perform_pipeline_action("download", url=url, target=str(target))
             status_bar.value = success_message if message.startswith("Download completed") else message
@@ -809,9 +621,59 @@ def _start_download_job(
     threading.Thread(target=do_download, daemon=True).start()
 
 
-def _queue_item(item: dict[str, str], status_bar: ft.Text, page: ft.Page) -> None:
+def _sync_playlist_folder(source_dir: Path, ipod_root: Path) -> list[Path]:
+    synced: list[Path] = []
+    for mp3_path in sorted(source_dir.glob("*.mp3")):
+        synced.append(sync_to_ipod(mp3_path, ipod_root, title=mp3_path.stem))
+    return synced
+
+
+def _start_sync_job(
+    item: dict[str, str],
+    ipod_root: Path,
+    status_bar: ft.Text,
+    page: ft.Page,
+) -> None:
+    if not str(ipod_root).strip():
+        status_bar.value = _t("ipod_root_prompt")
+        page.update()
+        return
+
+    status_bar.value = _t("start_sync", title=item["title"])
+    page.update()
+
+    def do_sync() -> None:
+        try:
+            source = _download_target_for_item(item)
+            if item.get("kind") == "playlist":
+                if not source.exists():
+                    download_message = perform_pipeline_action("download", url=item["url"], target=str(source))
+                    if not download_message.startswith("Download completed"):
+                        raise RuntimeError(download_message)
+                synced = _sync_playlist_folder(source, ipod_root)
+                if not synced:
+                    raise RuntimeError("No MP3 files were found in the playlist folder.")
+                status_bar.value = _t("sync_playlist_complete", count=len(synced))
+            else:
+                if not source.exists():
+                    download_message = perform_pipeline_action("download", url=item["url"], target=str(source))
+                    if not download_message.startswith("Download completed"):
+                        raise RuntimeError(download_message)
+                target = sync_to_ipod(source, ipod_root, title=item["title"])
+                status_bar.value = _t("sync_complete", name=target.name)
+        except Exception as exc:
+            status_bar.value = _t("error", message=exc)
+
+        page.update()
+
+    threading.Thread(target=do_sync, daemon=True).start()
+
+
+def _queue_item(item: dict[str, str], status_bar: ft.Text, page: ft.Page, queue_count_text: ft.Text | None = None) -> None:
     DOWNLOAD_QUEUE.append(item)
     status_bar.value = _t("queued_added", title=item["title"])
+    if queue_count_text is not None:
+        queue_count_text.value = f"Queue: {len(DOWNLOAD_QUEUE)}"
     page.update()
 
 
@@ -845,225 +707,192 @@ def _download_item(
     )
 
 
-# --- Flet UI ---
+def _is_mobile_platform(page: ft.Page) -> bool:
+    platform = getattr(page, "platform", None)
+    if platform is None:
+        return False
 
-class MediaCard(ft.Container):
-    def __init__(
-        self,
-        item: dict[str, str],
-        colors: dict[str, str],
-        status_bar: ft.Text,
-        *,
-        selected: bool = False,
-        hovered: bool = False,
-        key: str | None = None,
-        on_select: Any | None = None,
-        on_hover_change: Any | None = None,
-    ):
-        self.item = item
-        self.colors = colors
-        self.status_bar = status_bar
-        self.selected = selected
-        self.hovered = hovered
-        self._hover_change = on_hover_change
-        cover_source = _cover_source(item)
-        source_label = _source_display_label(item.get("source", ""))
-        subtitle_label = f"{item['artist']} · {source_label}"
-        self._base_bgcolor = "#17181C"
-        self._hover_bgcolor = "#1B1D22"
-        self._selected_bgcolor = "#1A1F1D"
-        self._base_border = "#24262B"
-        self._hover_border = "#2E3238"
-        self._selected_border = colors["primary"]
-        self._base_shadow = ft.BoxShadow(
-            spread_radius=0,
-            blur_radius=10,
-            color="#00000028",
-            offset=ft.Offset(0, 4),
-        )
-        self._hover_shadow = ft.BoxShadow(
-            spread_radius=0,
-            blur_radius=12,
-            color="#0000003A",
-            offset=ft.Offset(0, 5),
-        )
-        self._selected_shadow = ft.BoxShadow(
-            spread_radius=0,
-            blur_radius=14,
-            color="#1DB95426" if selected else "#0000003A",
-            offset=ft.Offset(0, 5),
-        )
-        self._thumbnail = ft.Container(
-            width=76,
-            height=76,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            border_radius=11,
-            bgcolor="#0D0D10",
-            content=ft.Image(
-                src=cover_source,
-                fit=ft.BoxFit.COVER,
-                expand=True,
-                error_content=ft.Container(
-                    alignment=ft.Alignment(0, 0),
-                    bgcolor="#0D0D10",
-                    content=ft.Icon(
-                        ft.Icons.ALBUM,
-                        color=colors["primary"],
-                        size=30,
+    value = getattr(platform, "value", None)
+    if isinstance(value, str):
+        return value in {"android", "ios", "android_tv"}
+
+    checker = getattr(platform, "is_mobile", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    return False
+
+
+def _icon_button(icon: str, *, tooltip: str, on_click: Any, background: str | None = None) -> ft.IconButton:
+    kwargs: dict[str, Any] = {
+        "icon": icon,
+        "icon_color": ft.Colors.WHITE,
+        "icon_size": 18,
+        "tooltip": tooltip,
+        "on_click": on_click,
+    }
+    if background is not None:
+        kwargs["bgcolor"] = background
+    return ft.IconButton(**kwargs)
+
+
+def build_media_card(
+    item: dict[str, str],
+    colors: dict[str, str],
+    *,
+    key: str | None = None,
+    selected: bool = False,
+    on_select: Any | None = None,
+    on_queue: Any | None = None,
+    on_download: Any | None = None,
+    on_sync: Any | None = None,
+) -> ft.Container:
+    cover_source = _cover_source(item)
+    source_label = _source_display_label(item.get("source", ""))
+    kind_label = "Playlist" if item.get("kind") == "playlist" else source_label
+    track_count = item.get("track_count")
+    if track_count and item.get("kind") == "playlist":
+        subtitle_label = f"{item['artist']} · {kind_label} · {track_count} tracks"
+    else:
+        subtitle_label = f"{item['artist']} · {kind_label}"
+
+    title_text = ft.Text(
+        item["title"],
+        weight=ft.FontWeight.W_700,
+        color=ft.Colors.WHITE,
+        size=15,
+        max_lines=1,
+        overflow=ft.TextOverflow.ELLIPSIS,
+    )
+    subtitle_text = ft.Text(
+        subtitle_label,
+        color=ft.Colors.WHITE60,
+        size=11,
+        max_lines=2,
+        overflow=ft.TextOverflow.ELLIPSIS,
+    )
+
+    action_row = ft.Row(
+        controls=[
+            _icon_button(ft.Icons.PLAYLIST_ADD, tooltip=_t("queue_button"), on_click=on_queue, background="#1a1f25"),
+            _icon_button(ft.Icons.DOWNLOAD, tooltip=_t("download_selected_tooltip"), on_click=on_download, background=colors["primary"]),
+            _icon_button(ft.Icons.SYNC, tooltip=_t("sync_selected_tooltip"), on_click=on_sync, background="#143224"),
+        ],
+        spacing=6,
+        tight=True,
+    )
+
+    body = ft.Row(
+        controls=[
+            ft.Container(
+                width=64,
+                height=64,
+                border_radius=14,
+                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                bgcolor="#091017",
+                content=ft.Image(
+                    src=cover_source,
+                    fit=ft.BoxFit.COVER,
+                    width=64,
+                    height=64,
+                    error_content=ft.Container(
+                        alignment=ft.Alignment(0, 0),
+                        bgcolor="#091017",
+                        content=ft.Icon(ft.Icons.ALBUM, color=colors["primary"], size=28),
                     ),
                 ),
             ),
-        )
-        self._title_text = ft.Text(
-            item["title"],
-            weight=ft.FontWeight.W_700,
-            color=ft.Colors.WHITE,
-            size=15,
-            max_lines=1,
-            overflow=ft.TextOverflow.ELLIPSIS,
-        )
-        self._subtitle_text = ft.Text(
-            subtitle_label,
-            color=ft.Colors.WHITE60,
-            size=11,
-            max_lines=1,
-            overflow=ft.TextOverflow.ELLIPSIS,
-        )
-        self._text_column = ft.Column(
-            controls=[
-                self._title_text,
-                self._subtitle_text,
-            ],
-            spacing=4,
-            tight=True,
-            expand=True,
-            alignment=ft.MainAxisAlignment.CENTER,
-            horizontal_alignment=ft.CrossAxisAlignment.START,
-        )
-        self._queue_button = ft.IconButton(
-            icon=ft.Icons.PLAYLIST_ADD,
-            icon_color=ft.Colors.WHITE,
-            icon_size=18,
-            tooltip=_t("queue_button"),
-            on_click=self.add_to_queue,
-            bgcolor="#22252A",
-            hover_color="#2B2F36",
-            width=34,
-            height=34,
-            padding=0,
-            style=ft.ButtonStyle(
-                shape=ft.RoundedRectangleBorder(radius=10),
-            ),
-        )
-        self._download_button = ft.IconButton(
-            icon=ft.Icons.DOWNLOAD,
-            icon_color=ft.Colors.WHITE,
-            icon_size=18,
-            tooltip=_t("download_button"),
-            on_click=self.download,
-            bgcolor=colors["primary"],
-            hover_color="#36C95B",
-            width=34,
-            height=34,
-            padding=0,
-            style=ft.ButtonStyle(
-                shape=ft.RoundedRectangleBorder(radius=10),
-            ),
-        )
-        self._action_column = ft.Column(
-            controls=[
-                self._queue_button,
-                self._download_button,
-            ],
-            spacing=6,
-            tight=True,
-            alignment=ft.MainAxisAlignment.CENTER,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        )
-        self._row = ft.Row(
-            controls=[
-                self._thumbnail,
-                ft.Container(
+            ft.Container(
+                expand=True,
+                padding=ft.Padding(10, 2, 10, 2),
+                content=ft.Column(
+                    controls=[title_text, subtitle_text],
+                    spacing=4,
+                    tight=True,
                     expand=True,
-                    padding=ft.Padding(12, 4, 12, 4),
-                    content=self._text_column,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    horizontal_alignment=ft.CrossAxisAlignment.START,
                 ),
-                self._action_column,
-            ],
-            spacing=12,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        )
+            ),
+            ft.Container(
+                content=action_row,
+                alignment=ft.Alignment(0, 0),
+            ),
+        ],
+        spacing=12,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
 
-        super().__init__(
-            key=key,
-            expand=True,
-            height=96,
-            padding=10,
-            bgcolor=self._selected_bgcolor if selected else self._base_bgcolor,
-            border=_border(self._selected_border if selected else self._base_border, 1),
-            border_radius=12,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            shadow=self._selected_shadow if selected else self._base_shadow,
-            on_hover=self._handle_hover,
-            on_click=on_select,
-            content=self._row,
-        )
-        self._apply_visual_state()
-
-    def _apply_visual_state(self) -> None:
-        if self.hovered:
-            self.bgcolor = self._hover_bgcolor
-            self.border = _border(self._selected_border if self.selected else self._hover_border, 1)
-            self.shadow = self._selected_shadow if self.selected else self._hover_shadow
-            self._action_column.opacity = 1.0
-        else:
-            self.bgcolor = self._selected_bgcolor if self.selected else self._base_bgcolor
-            self.border = _border(self._selected_border if self.selected else self._base_border, 1)
-            self.shadow = self._selected_shadow if self.selected else self._base_shadow
-            self._action_column.opacity = 0.96 if self.selected else 0.82
-
-    def _handle_hover(self, e):
-        hovered = str(getattr(e, "data", "")).lower() == "true"
-        if callable(self._hover_change):
-            self._hover_change(hovered)
-
-    def add_to_queue(self, e):
-        _queue_item(self.item, self.status_bar, self.page)
-
-    def download(self, e):
-        _download_item(self.item, self.status_bar, self.page)
+    return ft.Container(
+        key=key,
+        expand=True,
+        padding=12,
+        margin=ft.Margin(0, 0, 0, 0),
+        bgcolor=colors["surface_selected"] if selected else colors["surface"],
+        border_radius=18,
+        border=_border(colors["primary"] if selected else colors["border"], 1),
+        shadow=ft.BoxShadow(
+            spread_radius=0,
+            blur_radius=16 if selected else 10,
+            color="#00000044" if selected else "#0000002c",
+            offset=ft.Offset(0, 6),
+        ),
+        ink=True,
+        on_click=on_select,
+        content=body,
+    )
 
 
-def main(page: ft.Page):
-    _apply_window_icon(page)
-    page.title = "iPodify"
-    page.theme_mode = ft.ThemeMode.DARK
-
+def main(page: ft.Page) -> None:
     colors = {
-        "background": "#0B0B0D",
-        "surface": "#121214",
+        "background": "#071018",
+        "background_alt": "#0A1520",
+        "surface": "#111A24",
+        "surface_selected": "#13251A",
+        "border": "#223243",
         "primary": "#1DB954",
-        "text": "#FFFFFF",
-        "panel": "#202025",
+        "primary_soft": "#30d36b",
+        "text": "#F8FAFC",
+        "muted": "#9AA4B2",
     }
-    _configure_window(page, colors)
+
+    _apply_window_icon(page)
+    page.title = "NanoSync"
+    page.theme_mode = ft.ThemeMode.DARK
+    page.scroll = ft.ScrollMode.AUTO
+
+    if _is_mobile_platform(page):
+        page.padding = 0
+        page.spacing = 0
+    else:
+        _configure_window(page, colors)
+
     page.bgcolor = colors["background"]
 
-    status_bar = ft.Text(_t("ready"), color=ft.Colors.WHITE54, size=11)
-    result_count_text = ft.Text(_t("no_results"), color=ft.Colors.WHITE54, size=10)
+    status_bar = ft.Text(_t("ready"), color=colors["muted"], size=11)
+    result_count_text = ft.Text(_t("no_results"), color=colors["muted"], size=11)
+    queue_count_text = ft.Text("Queue: 0", color=colors["muted"], size=11)
     result_list = ft.ListView(
         expand=True,
-        spacing=6,
+        spacing=10,
         padding=0,
         build_controls_on_demand=True,
-        item_extent=96,
     )
-    current_results: list[dict[str, str]] = []
+    current_results = safe_search_results("")
     selected_index = 0
-    hovered_index = -1
-    menu_open = False
-    updating_results = False
     status_state: dict[str, Any] = {"key": "ready", "kwargs": {}}
+
+    folder_picker = ft.FilePicker()
+    page.overlay.append(folder_picker)
+
+    def set_status(key: str, **kwargs: Any) -> None:
+        status_state["key"] = key
+        status_state["kwargs"] = kwargs
+        status_bar.value = _t(key, **kwargs)
+        page.update()
 
     def selected_item() -> dict[str, str] | None:
         if not current_results:
@@ -1073,108 +902,57 @@ def main(page: ft.Page):
 
     def build_placeholder_card() -> ft.Container:
         return ft.Container(
-            height=96,
             expand=True,
-            border_radius=12,
-            padding=12,
-            bgcolor="#111114",
-            border=_border("#24262B"),
+            padding=16,
+            border_radius=18,
+            bgcolor=colors["surface"],
+            border=_border(colors["border"], 1),
             content=ft.Row(
                 controls=[
-                    ft.Icon(ft.Icons.CIRCLE_OUTLINED, color=ft.Colors.WHITE54, size=26),
+                    ft.Icon(ft.Icons.MUSIC_NOTE_OUTLINED, color=colors["primary"], size=28),
                     ft.Column(
                         controls=[
-                            ft.Text(_t("no_results"), color=ft.Colors.WHITE, size=14, weight=ft.FontWeight.W_600),
-                            ft.Text(_t("no_results_hint"), color=ft.Colors.WHITE54, size=10, overflow=ft.TextOverflow.ELLIPSIS, max_lines=1),
+                            ft.Text(_t("no_results"), color=ft.Colors.WHITE, size=14, weight=ft.FontWeight.W_700),
+                            ft.Text(_t("no_results_hint"), color=colors["muted"], size=11),
                         ],
                         spacing=2,
                         tight=True,
                         expand=True,
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        horizontal_alignment=ft.CrossAxisAlignment.START,
                     ),
                 ],
-                spacing=10,
+                spacing=12,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
         )
 
-    def select_result(index: int, *, announce: bool = True) -> None:
+    def render_results(*, scroll: bool = True) -> None:
         nonlocal selected_index
 
-        if not current_results:
-            return
-
-        selected_index = max(0, min(index, len(current_results) - 1))
-        if announce:
-            set_status("selected_prefix", title=current_results[selected_index]["title"])
-        render_results()
-
-    def set_hovered_result(index: int, hovered: bool) -> None:
-        nonlocal hovered_index
-
-        if hovered:
-            if hovered_index == index:
-                return
-            hovered_index = index
-        elif hovered_index == index:
-            hovered_index = -1
+        result_list.controls.clear()
+        if current_results:
+            selected_index = max(0, min(selected_index, len(current_results) - 1))
+            result_count_text.value = _t("results_found", count=len(current_results))
+            result_list.controls.extend(
+                build_media_card(
+                    item,
+                    colors,
+                    key=f"result-{index}",
+                    selected=index == selected_index,
+                    on_select=lambda _e, idx=index: select_result(idx),
+                    on_queue=lambda _e, idx=index: queue_selected(idx),
+                    on_download=lambda _e, idx=index: download_selected(idx),
+                    on_sync=lambda _e, idx=index: sync_selected(idx),
+                )
+                for index, item in enumerate(current_results)
+            )
         else:
-            return
+            selected_index = 0
+            result_count_text.value = _t("no_results")
+            result_list.controls.append(build_placeholder_card())
 
-        async def _refresh_hover() -> None:
-            try:
-                await asyncio.sleep(0)
-            except Exception:
-                pass
-            render_results(scroll=False)
+        page.update()
 
-        runner = getattr(page, "run_task", None)
-        if callable(runner):
-            try:
-                runner(_refresh_hover)
-                return
-            except Exception:
-                pass
-
-        render_results(scroll=False)
-
-    def build_result_card(item: dict[str, str], index: int) -> MediaCard:
-        return MediaCard(
-            item,
-            colors,
-            status_bar,
-            selected=index == selected_index,
-            hovered=index == hovered_index,
-            key=f"result-{index}",
-            on_select=lambda _e, idx=index: select_result(idx),
-            on_hover_change=lambda is_hovered, idx=index: set_hovered_result(idx, is_hovered),
-        )
-
-    def render_results(*, scroll: bool = True) -> None:
-        nonlocal selected_index, hovered_index, updating_results
-
-        if updating_results:
-            return
-
-        updating_results = True
-        try:
-            result_list.controls.clear()
-            if current_results:
-                selected_index = max(0, min(selected_index, len(current_results) - 1))
-                hovered_index = hovered_index if 0 <= hovered_index < len(current_results) else -1
-                result_count_text.value = _t("results_found", count=len(current_results))
-                result_list.controls.extend(build_result_card(item, idx) for idx, item in enumerate(current_results))
-            else:
-                selected_index = 0
-                hovered_index = -1
-                result_count_text.value = _t("no_results")
-                result_list.controls.append(build_placeholder_card())
-            page.update()
-        finally:
-            updating_results = False
-
-        if not current_results or not scroll:
+        if not scroll or not current_results:
             return
 
         async def _scroll_to_selected() -> None:
@@ -1183,55 +961,58 @@ def main(page: ft.Page):
             except Exception:
                 pass
 
-        runner = getattr(page, "run_task", None)
-        if callable(runner):
-            runner(_scroll_to_selected)
+        _run_async(page, _scroll_to_selected())
 
-    def set_status(key: str, **kwargs: Any) -> None:
-        status_state["key"] = key
-        status_state["kwargs"] = kwargs
-        status_bar.value = _t(key, **kwargs)
-        page.update()
+    def select_result(index: int, *, announce: bool = True) -> None:
+        nonlocal selected_index
+        if not current_results:
+            return
+        selected_index = max(0, min(index, len(current_results) - 1))
+        if announce:
+            set_status("selected_prefix", title=current_results[selected_index]["title"])
+        render_results(scroll=False)
 
-    def toggle_menu(_=None):
-        nonlocal menu_open
-        menu_open = not menu_open
-        menu_panel.visible = menu_open
-        page.update()
-
-    def perform_search(e):
-        nonlocal current_results, selected_index, hovered_index
-        query = e.control.value or ""
+    def perform_search(e: Any | None = None) -> None:
+        nonlocal current_results, selected_index
+        query = ""
+        if e is not None:
+            query = str(getattr(getattr(e, "control", None), "value", "") or "")
+        elif search_bar.value:
+            query = search_bar.value
         current_results = safe_search_results(query)
         selected_index = 0
-        hovered_index = -1
-        render_results()
-        set_status("results_found", count=len(current_results))
-
-    def move_cover(step: int):
-        if not current_results:
+        render_results(scroll=False)
+        if current_results:
+            set_status("results_found", count=len(current_results))
+        else:
             set_status("no_results")
-            return
 
-        select_result(selected_index + step)
-
-    def queue_selected(_=None):
-        item = selected_item()
+    def queue_selected(index: int | None = None) -> None:
+        item = current_results[index] if index is not None and 0 <= index < len(current_results) else selected_item()
         if item is None:
             set_status("no_item_queue")
             return
+        _queue_item(item, status_bar, page, queue_count_text=queue_count_text)
 
-        _queue_item(item, status_bar, page)
-
-    def download_selected(_=None):
-        item = selected_item()
+    def download_selected(index: int | None = None) -> None:
+        item = current_results[index] if index is not None and 0 <= index < len(current_results) else selected_item()
         if item is None:
             set_status("no_item_download")
             return
-
         _download_item(item, status_bar, page)
 
-    def import_playlist(e):
+    def sync_selected(index: int | None = None) -> None:
+        item = current_results[index] if index is not None and 0 <= index < len(current_results) else selected_item()
+        if item is None:
+            set_status("no_item_sync")
+            return
+        root_value = (ipod_root_field.value or "").strip()
+        if not root_value:
+            set_status("ipod_root_prompt")
+            return
+        _start_sync_job(item, Path(root_value), status_bar, page)
+
+    def import_playlist(e: Any | None = None) -> None:
         url = (playlist_url_field.value or "").strip()
         target = _playlist_download_target(url)
         if target is None:
@@ -1248,358 +1029,343 @@ def main(page: ft.Page):
             success_message=_t("playlist_imported", name=target.name),
         )
 
-    async def paste_playlist_from_clipboard(e):
+    async def pick_ipod_root() -> None:
+        chosen = await folder_picker.get_directory_path(dialog_title=_t("choose_folder"))
+        if chosen:
+            ipod_root_field.value = chosen
+            set_status("folder_selected", name=Path(chosen).name)
+            page.update()
+
+    def choose_ipod_root(_e: Any | None = None) -> None:
+        _run_async(page, pick_ipod_root())
+
+    async def paste_playlist_from_clipboard(_e: Any | None = None) -> None:
         clipboard_text = await _read_clipboard_text(page.clipboard)
         if not clipboard_text:
             set_status("clipboard_empty")
             return
-
         playlist_url_field.value = clipboard_text
         set_status("clipboard_pasted")
+        page.update()
 
+    def set_language(_e: Any | None = None) -> None:
+        selected_value = getattr(language_dropdown, "value", None) or "de"
+        _set_language(str(selected_value).strip())
+        apply_language()
+        render_results(scroll=False)
 
     search_bar = ft.TextField(
-        hint_text=_t('search_hint'),
+        hint_text=_t("search_hint"),
         prefix_icon=ft.Icons.SEARCH,
-        border_color='#2A2A30',
-        bgcolor='#151519',
-        border_radius=10,
+        border_color=colors["border"],
+        bgcolor=colors["background_alt"],
+        border_radius=14,
         color=ft.Colors.WHITE,
         on_submit=perform_search,
         on_change=perform_search,
     )
     playlist_url_field = ft.TextField(
-        hint_text=_t('playlist_hint'),
-        border_color='#2A2A30',
-        bgcolor='#151519',
-        border_radius=10,
+        hint_text=_t("playlist_hint"),
+        prefix_icon=ft.Icons.LINK,
+        border_color=colors["border"],
+        bgcolor=colors["background_alt"],
+        border_radius=14,
+        color=ft.Colors.WHITE,
+        expand=True,
+    )
+    ipod_root_field = ft.TextField(
+        hint_text=_t("ipod_root_hint"),
+        prefix_icon=ft.Icons.DRIVE_FILE_MOVE,
+        border_color=colors["border"],
+        bgcolor=colors["background_alt"],
+        border_radius=14,
         color=ft.Colors.WHITE,
         expand=True,
     )
 
-    screen_brand = ft.Row(
-        controls=[
-            ft.Image(src='logo.png', width=20, height=20, fit=ft.BoxFit.CONTAIN),
-            ft.Text('iPodify', weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE, size=14),
-        ],
-        spacing=8,
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-    )
-
-    menu_title_text = ft.Text(_t('menu_title'), size=11, color=ft.Colors.WHITE54)
-    menu_help_text = ft.Text(_t('menu_help'), color=ft.Colors.WHITE54, size=10)
-    screen_subtitle_text = ft.Text(_t('screen_subtitle'), color=ft.Colors.WHITE54, size=10)
-
-    def set_language(e=None):
-        selected_value = getattr(getattr(e, "control", None), "value", None) if e is not None else None
-        _set_language((selected_value or language_dropdown.value or "de").strip())
-        apply_language()
-        render_results(scroll=False)
-
     language_dropdown = ft.Dropdown(
         value=CURRENT_LANGUAGE,
-        label=_t('language_label'),
+        label=_t("language_label"),
         options=[ft.dropdown.Option(code, label) for code, label in LANGUAGE_CHOICES],
-        border_color='#2A2A30',
-        bgcolor='#151519',
-        border_radius=10,
+        border_color=colors["border"],
+        bgcolor=colors["background_alt"],
+        border_radius=14,
         color=ft.Colors.WHITE,
         width=180,
         dense=True,
-        on_select=set_language,
+        on_change=set_language,
     )
 
     menu_paste_button = ft.IconButton(
         ft.Icons.PASTE,
-        tooltip=_t('paste_tooltip'),
+        tooltip=_t("paste_tooltip"),
         on_click=paste_playlist_from_clipboard,
         icon_color=ft.Colors.WHITE70,
     )
     menu_import_button = ft.FilledButton(
-        _t('import_button'),
+        _t("import_button"),
         icon=ft.Icons.DOWNLOAD,
         on_click=import_playlist,
         style=ft.ButtonStyle(
-            shape=ft.RoundedRectangleBorder(radius=8),
-            bgcolor=colors['primary'],
+            shape=ft.RoundedRectangleBorder(radius=12),
+            bgcolor=colors["primary"],
             color=ft.Colors.WHITE,
         ),
     )
     menu_queue_button = ft.OutlinedButton(
-        _t('queue_button'),
+        _t("queue_button"),
         icon=ft.Icons.PLAYLIST_ADD,
-        on_click=queue_selected,
+        on_click=lambda _e: queue_selected(),
         style=ft.ButtonStyle(
-            shape=ft.RoundedRectangleBorder(radius=8),
+            shape=ft.RoundedRectangleBorder(radius=12),
             color=ft.Colors.WHITE,
         ),
     )
-    menu_toggle_button = ft.IconButton(
-        ft.Icons.MENU,
-        on_click=toggle_menu,
-        icon_color=ft.Colors.WHITE,
-        tooltip=_t('menu_tooltip'),
-    )
-
-    def apply_language():
-        search_bar.hint_text = _t('search_hint')
-        playlist_url_field.hint_text = _t('playlist_hint')
-        menu_title_text.value = _t('menu_title')
-        menu_help_text.value = _t('menu_help')
-        screen_subtitle_text.value = _t('screen_subtitle')
-        language_dropdown.label = _t('language_label')
-        language_dropdown.value = CURRENT_LANGUAGE
-        menu_paste_button.tooltip = _t('paste_tooltip')
-        menu_import_button.text = _t('import_button')
-        menu_queue_button.text = _t('queue_button')
-        menu_toggle_button.tooltip = _t('menu_tooltip')
-        wheel_menu_button.tooltip = _t('menu_tooltip')
-        wheel_prev_button.tooltip = _t('previous_tooltip')
-        wheel_next_button.tooltip = _t('next_tooltip')
-        wheel_download_button.tooltip = _t('download_selected_tooltip')
-        status_bar.value = _t(status_state['key'], **status_state['kwargs'])
-
-    menu_panel = ft.Container(
-        visible=False,
-        animate_opacity=180,
-        border_radius=14,
-        bgcolor='#111114',
-        border=_border('#303038'),
-        padding=10,
-        content=ft.Column(
-            controls=[
-                ft.Row(
-                    controls=[menu_title_text, language_dropdown],
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                search_bar,
-                ft.Row(
-                    controls=[
-                        playlist_url_field,
-                        menu_paste_button,
-                    ],
-                    spacing=8,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                ft.Row(
-                    controls=[menu_import_button, menu_queue_button],
-                    spacing=8,
-                    wrap=True,
-                ),
-                menu_help_text,
-            ],
-            spacing=8,
+    choose_folder_button = ft.OutlinedButton(
+        _t("choose_folder"),
+        icon=ft.Icons.FOLDER_OPEN,
+        on_click=choose_ipod_root,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=12),
+            color=ft.Colors.WHITE,
         ),
-        key='menu-panel',
+    )
+    download_button = ft.FilledButton(
+        _t("download_button"),
+        icon=ft.Icons.DOWNLOAD,
+        on_click=lambda _e: download_selected(),
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=12),
+            bgcolor=colors["primary"],
+            color=ft.Colors.WHITE,
+        ),
+    )
+    sync_button = ft.FilledButton(
+        _t("download_and_sync"),
+        icon=ft.Icons.SYNC,
+        on_click=lambda _e: sync_selected(),
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=12),
+            bgcolor=colors["primary_soft"],
+            color=ft.Colors.WHITE,
+        ),
     )
 
-    screen_panel = ft.Container(
-        width=IPOD_SCREEN_WIDTH,
-        height=IPOD_SCREEN_HEIGHT,
-        bgcolor='#050505',
-        border_radius=30,
-        border=_border('#37373D'),
-        padding=4,
-        shadow=ft.BoxShadow(spread_radius=0, blur_radius=18, color='#00000077', offset=ft.Offset(0, 6)),
+    menu_title_text = ft.Text(_t("menu_title"), size=15, weight=ft.FontWeight.W_700, color=ft.Colors.WHITE)
+    menu_help_text = ft.Text(_t("menu_help"), color=colors["muted"], size=11)
+    screen_subtitle_text = ft.Text(_t("screen_subtitle"), color=colors["muted"], size=11)
+
+    def apply_language() -> None:
+        search_bar.hint_text = _t("search_hint")
+        playlist_url_field.hint_text = _t("playlist_hint")
+        ipod_root_field.hint_text = _t("ipod_root_hint")
+        language_dropdown.label = _t("language_label")
+        menu_title_text.value = _t("menu_title")
+        menu_help_text.value = _t("menu_help")
+        screen_subtitle_text.value = _t("screen_subtitle")
+        menu_paste_button.tooltip = _t("paste_tooltip")
+        menu_import_button.text = _t("import_button")
+        menu_queue_button.text = _t("queue_button")
+        choose_folder_button.text = _t("choose_folder")
+        download_button.text = _t("download_button")
+        sync_button.text = _t("download_and_sync")
+        status_bar.value = _t(status_state["key"], **status_state["kwargs"])
+
+    control_card = ft.Container(
+        expand=True,
+        padding=16,
+        border_radius=22,
+        bgcolor=colors["surface"],
+        border=_border(colors["border"], 1),
+        shadow=ft.BoxShadow(spread_radius=0, blur_radius=18, color="#00000033", offset=ft.Offset(0, 8)),
         content=ft.Column(
             controls=[
                 ft.Row(
                     controls=[
-                        menu_toggle_button,
+                        ft.Container(
+                            width=46,
+                            height=46,
+                            border_radius=14,
+                            bgcolor="#0c1520",
+                            alignment=ft.Alignment(0, 0),
+                            content=ft.Image(src="logo.png", width=24, height=24, fit=ft.BoxFit.CONTAIN),
+                        ),
                         ft.Column(
                             controls=[
-                                screen_brand,
+                                ft.Text("NanoSync", size=20, weight=ft.FontWeight.W_800, color=ft.Colors.WHITE),
                                 screen_subtitle_text,
                             ],
                             spacing=0,
+                            tight=True,
                             expand=True,
                         ),
-                        result_count_text,
+                        queue_count_text,
                     ],
-                    spacing=8,
+                    spacing=12,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-                menu_panel,
-                ft.Container(expand=True, content=result_list),
-                status_bar,
+                menu_title_text,
+                menu_help_text,
+                ft.Container(
+                    padding=12,
+                    border_radius=18,
+                    bgcolor=colors["background_alt"],
+                    content=ft.Column(
+                        controls=[
+                            search_bar,
+                            ft.Row(
+                                controls=[playlist_url_field, menu_paste_button],
+                                spacing=8,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                            ft.Row(
+                                controls=[ipod_root_field, choose_folder_button],
+                                spacing=8,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                            ft.Row(
+                                controls=[download_button, sync_button, menu_import_button, menu_queue_button],
+                                spacing=8,
+                                wrap=True,
+                            ),
+                            language_dropdown,
+                        ],
+                        spacing=10,
+                    ),
+                ),
             ],
-            spacing=8,
+            spacing=12,
+        ),
+    )
+
+    results_header = ft.Row(
+        controls=[
+            ft.Text("Library", size=18, weight=ft.FontWeight.W_700, color=ft.Colors.WHITE),
+            result_count_text,
+        ],
+        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+
+    results_card = ft.Container(
+        expand=True,
+        padding=16,
+        border_radius=22,
+        bgcolor=colors["surface"],
+        border=_border(colors["border"], 1),
+        shadow=ft.BoxShadow(spread_radius=0, blur_radius=18, color="#00000033", offset=ft.Offset(0, 8)),
+        content=ft.Column(
+            controls=[results_header, ft.Container(expand=True, content=result_list)],
+            spacing=12,
             expand=True,
         ),
     )
 
-    wheel_menu_button = ft.IconButton(
-        ft.Icons.MENU,
-        icon_color=ft.Colors.WHITE,
-        icon_size=18,
-        tooltip=_t('menu_tooltip'),
-        on_click=toggle_menu,
-    )
-    wheel_prev_button = ft.IconButton(
-        ft.Icons.KEYBOARD_ARROW_LEFT,
-        icon_color=ft.Colors.WHITE,
-        icon_size=20,
-        tooltip=_t('previous_tooltip'),
-        on_click=lambda _e: move_cover(-1),
-    )
-    wheel_next_button = ft.IconButton(
-        ft.Icons.KEYBOARD_ARROW_RIGHT,
-        icon_color=ft.Colors.WHITE,
-        icon_size=20,
-        tooltip=_t('next_tooltip'),
-        on_click=lambda _e: move_cover(1),
-    )
-    wheel_download_button = ft.IconButton(
-        ft.Icons.PLAY_ARROW,
-        icon_color=ft.Colors.WHITE,
-        icon_size=20,
-        tooltip=_t('download_selected_tooltip'),
-        on_click=download_selected,
-    )
+    def build_body() -> ft.Control:
+        if _is_mobile_platform(page):
+            return ft.Column(
+                controls=[control_card, results_card, status_bar],
+                spacing=16,
+                expand=True,
+            )
+
+        return ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[
+                        ft.Container(width=400, content=control_card),
+                        ft.Container(expand=True, content=results_card),
+                    ],
+                    spacing=16,
+                    expand=True,
+                ),
+                status_bar,
+            ],
+            spacing=12,
+            expand=True,
+        )
+
+    def refresh_results() -> None:
+        result_list.controls.clear()
+        if current_results:
+            result_count_text.value = _t("results_found", count=len(current_results))
+            result_list.controls.extend(
+                build_media_card(
+                    item,
+                    colors,
+                    selected=index == selected_index,
+                    on_select=lambda _e, idx=index: select_result(idx),
+                    on_queue=lambda _e, idx=index: queue_selected(idx),
+                    on_download=lambda _e, idx=index: download_selected(idx),
+                    on_sync=lambda _e, idx=index: sync_selected(idx),
+                )
+                for index, item in enumerate(current_results)
+            )
+        else:
+            result_count_text.value = _t("no_results")
+            result_list.controls.append(build_placeholder_card())
+        page.update()
 
     apply_language()
 
-    wheel_panel = ft.Container(
-        width=IPOD_WHEEL_SIZE,
-        height=IPOD_WHEEL_SIZE,
-        shape=ft.BoxShape.CIRCLE,
-        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-        bgcolor='#0E0E10',
-        border=_border('#736A61', 2),
-        alignment=ft.Alignment(0, 0),
-        shadow=ft.BoxShadow(spread_radius=0, blur_radius=24, color='#00000088', offset=ft.Offset(0, 8)),
-        content=ft.Stack(
-            controls=[
-                ft.Container(
-                    left=6,
-                    top=6,
-                    right=6,
-                    bottom=6,
-                    shape=ft.BoxShape.CIRCLE,
-                    gradient=ft.LinearGradient(
-                        begin=ft.Alignment(-1, -1),
-                        end=ft.Alignment(1, 1),
-                        colors=['#1B1B1F', '#0A0A0B'],
-                    ),
-                ),
-                ft.Container(
-                    left=66,
-                    top=10,
-                    width=60,
-                    height=32,
-                    alignment=ft.Alignment(0, 0),
-                    content=wheel_menu_button,
-                ),
-                ft.Container(
-                    left=10,
-                    top=72,
-                    width=40,
-                    height=44,
-                    alignment=ft.Alignment(0, 0),
-                    content=wheel_prev_button,
-                ),
-                ft.Container(
-                    right=10,
-                    top=72,
-                    width=40,
-                    height=44,
-                    alignment=ft.Alignment(0, 0),
-                    content=wheel_next_button,
-                ),
-                ft.Container(
-                    left=60,
-                    top=60,
-                    width=72,
-                    height=72,
-                    shape=ft.BoxShape.CIRCLE,
-                    bgcolor='#18181A',
-                    border=_border('#7B7269', 1),
-                    alignment=ft.Alignment(0, 0),
-                    ink=True,
-                    on_click=queue_selected,
-                    content=ft.Icon(ft.Icons.PLAYLIST_ADD, color=ft.Colors.WHITE54, size=20),
-                ),
-                ft.Container(
-                    left=67,
-                    bottom=12,
-                    width=58,
-                    height=32,
-                    alignment=ft.Alignment(0, 0),
-                    content=wheel_download_button,
-                ),
-            ]
-        ),
+    header_glow = ft.Container(
+        right=-120,
+        top=-120,
+        width=260,
+        height=260,
+        border_radius=130,
+        bgcolor="#1db95422",
     )
-    front_shell = ft.Container(
-        width=IPOD_BODY_WIDTH,
-        height=IPOD_BODY_HEIGHT,
-        border_radius=56,
-        gradient=ft.LinearGradient(
-            begin=ft.Alignment(-1, -1),
-            end=ft.Alignment(1, 1),
-            colors=["#F6F1E8", "#E0D5C7", "#B7AB9C"],
-        ),
-        padding=12,
-        shadow=ft.BoxShadow(spread_radius=0, blur_radius=34, color="#00000077", offset=ft.Offset(0, 16)),
-        content=ft.Column(
-            controls=[
-                ft.WindowDragArea(
-                    maximizable=False,
-                    content=ft.Container(
-                        height=14,
-                        width=IPOD_BODY_WIDTH - 24,
-                        bgcolor=ft.Colors.TRANSPARENT,
-                    ),
-                ),
-                screen_panel,
-                wheel_panel,
-            ],
-            spacing=10,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        ),
+    footer_glow = ft.Container(
+        left=-60,
+        bottom=-120,
+        width=180,
+        height=180,
+        border_radius=90,
+        bgcolor="#5b9cff18",
     )
 
-    back_cover = ft.Container(
-        left=0,
-        top=0,
-        width=IPOD_BODY_WIDTH,
-        height=IPOD_BODY_HEIGHT,
-        opacity=0.11,
-        content=ft.Image(src="3d/ipodminicover.png", fit=ft.BoxFit.CONTAIN),
-    )
-
-    device_stage = ft.Stack(
-        width=IPOD_STAGE_WIDTH,
-        height=IPOD_STAGE_HEIGHT,
-        controls=[
-            back_cover,
-            ft.Container(
-                left=0,
-                top=0,
-                width=IPOD_BODY_WIDTH,
-                height=IPOD_BODY_HEIGHT,
-                content=front_shell,
-            ),
-        ],
-    )
-
-    page.add(
-        ft.Container(
+    root = ft.SafeArea(
+        content=ft.Container(
             expand=True,
+            padding=16,
             alignment=ft.Alignment(0, 0),
-            padding=0,
-            margin=0,
-            bgcolor=colors["background"],
-            content=device_stage,
+            content=ft.Stack(
+                expand=True,
+                controls=[
+                    ft.Container(
+                        expand=True,
+                        gradient=ft.LinearGradient(
+                            begin=ft.Alignment(-1, -1),
+                            end=ft.Alignment(1, 1),
+                            colors=[colors["background"], colors["background_alt"], "#050a12"],
+                        ),
+                    ),
+                    header_glow,
+                    footer_glow,
+                    ft.Container(
+                        expand=True,
+                        padding=0,
+                        content=ft.Container(
+                            constraints=ft.BoxConstraints(max_width=1200),
+                            alignment=ft.Alignment(0, 0),
+                            content=build_body(),
+                        ),
+                    ),
+                ],
+            ),
         )
     )
-    if search_bar.value is None:
-        search_bar.value = ""
-    perform_search(SimpleNamespace(control=search_bar))
+
+    page.add(root)
+    refresh_results()
     page.update()
 
 
-def launch_gui():
+def launch_gui() -> None:
     _ensure_logo_ico()
     ft.app(target=main, assets_dir=str(assets_root))
+
+
+if __name__ == "__main__":
+    launch_gui()
