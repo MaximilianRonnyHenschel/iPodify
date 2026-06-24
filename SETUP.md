@@ -16,13 +16,19 @@ cd 'c:\Users\m.henschel\OneDrive - MEBA Metall-Bandsägemaschinen GmbH\Desktop\B
 ## Run the CLI
 
 ```powershell
-.\.venv\Scripts\python.exe main.py --dry-run input.mp4 output.mp4
+.\.venv\Scripts\python.exe main.py --dry-run input.mp3 output.mp3
 ```
 
 ## Start the GUI
 
 ```powershell
 .\.venv\Scripts\python.exe gui.py
+```
+
+## Build the Android APK
+
+```powershell
+.\build_android.bat
 ```
 
 ## Next steps
